@@ -57,6 +57,7 @@ struct ngx_peer_connection_s {
 
     int                              type;
     int                              rcvbuf;
+    uint32_t                         so_mark;
 
     ngx_log_t                       *log;
 
