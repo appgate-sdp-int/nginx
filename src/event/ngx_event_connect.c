@@ -73,6 +73,16 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
         }
     }
 
+    if (pc->so_mark) {
+        if (setsockopt(s, SOL_SOCKET, SO_MARK,
+                       (const void *) &pc->so_mark, sizeof(uint32_t)) == -1)
+        {
+            ngx_log_error(NGX_LOG_ALERT, pc->log, ngx_socket_errno,
+                          "setsockopt(SO_MARK) failed");
+            goto failed;
+        }
+    }
+
     if (pc->so_keepalive) {
         value = 1;
 

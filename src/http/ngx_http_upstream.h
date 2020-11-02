@@ -172,6 +172,7 @@ typedef struct {
     ngx_uint_t                       next_upstream;
     ngx_uint_t                       store_access;
     ngx_uint_t                       next_upstream_tries;
+    ngx_flag_t                       so_marking;
     ngx_flag_t                       buffering;
     ngx_flag_t                       request_buffering;
     ngx_flag_t                       pass_request_headers;
@@ -388,6 +389,7 @@ struct ngx_http_upstream_s {
     unsigned                         cache_status:3;
 #endif
 
+    unsigned                         so_marking:1;
     unsigned                         buffering:1;
     unsigned                         keepalive:1;
     unsigned                         upgrade:1;

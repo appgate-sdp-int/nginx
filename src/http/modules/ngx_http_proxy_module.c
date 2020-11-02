@@ -296,6 +296,13 @@ static ngx_command_t  ngx_http_proxy_commands[] = {
       offsetof(ngx_http_proxy_loc_conf_t, upstream.store_access),
       NULL },
 
+    { ngx_string("proxy_so_marking"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_loc_conf_t, upstream.so_marking),
+      NULL },
+    
     { ngx_string("proxy_buffering"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -910,6 +917,7 @@ ngx_http_proxy_handler(ngx_http_request_t *r)
         u->rewrite_cookie = ngx_http_proxy_rewrite_cookie;
     }
 
+    u->so_marking = plcf->upstream.so_marking;
     u->buffering = plcf->upstream.buffering;
 
     u->pipe = ngx_pcalloc(r->pool, sizeof(ngx_event_pipe_t));
@@ -1145,12 +1153,149 @@ ngx_http_proxy_create_key(ngx_http_request_t *r)
 
 #endif
 
+static ngx_int_t
+ngx_http_proxy_parse_cookie(ngx_str_t *value, ngx_array_t *attrs)
+{
+    u_char        *start, *end, *p, *last;
+    ngx_str_t      name, val;
+    ngx_keyval_t  *attr;
+
+    start = value->data;
+    end = value->data + value->len;
+
+    for ( ;; ) {
+
+        last = (u_char *) ngx_strchr(start, ';');
+
+        if (last == NULL) {
+            last = end;
+        }
+
+        while (start < last && *start == ' ') { start++; }
+
+        for (p = start; p < last && *p != '='; p++) { /* void */ }
+
+        name.data = start;
+        name.len = p - start;
+
+        while (name.len && name.data[name.len - 1] == ' ') {
+            name.len--;
+        }
+
+        if (p < last) {
+
+            p++;
+
+            while (p < last && *p == ' ') { p++; }
+
+            val.data = p;
+            val.len = last - val.data;
+
+            while (val.len && val.data[val.len - 1] == ' ') {
+                val.len--;
+            }
+
+        } else {
+            ngx_str_null(&val);
+        }
+
+        attr = ngx_array_push(attrs);
+        if (attr == NULL) {
+            return NGX_ERROR;
+        }
+
+        attr->key = name;
+        attr->value = val;
+
+        if (last == end) {
+            break;
+        }
+
+        start = last + 1;
+    }
+
+    return NGX_OK;
+}
+
+static char *
+ngx_pcstrdup(ngx_pool_t *pool, const ngx_str_t *src)
+{
+    char *dst = ngx_pnalloc(pool, src->len + 1);
+    if (!dst) {
+        exit(EXIT_FAILURE);
+    }
+
+    ngx_memcpy(dst, src->data, src->len);
+    dst[src->len] = '\0';
+
+    return dst;
+}
+
+static ngx_int_t
+ngx_http_proxy_get_cookie_mark(ngx_http_request_t *r, uint32_t *so_mark)
+{
+    ngx_str_t        *key, *value;
+    ngx_uint_t        i, j;
+    ngx_array_t       attrs;
+    ngx_keyval_t     *attr;
+    ngx_table_elt_t **h;
+
+    h = r->headers_in.cookies.elts;
+    for (i = 0; i < r->headers_in.cookies.nelts; i++) {
+        if (ngx_array_init(&attrs, r->pool, 2, sizeof(ngx_keyval_t)) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        if (ngx_http_proxy_parse_cookie(&h[i]->value, &attrs) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        attr = attrs.elts;
+        for (j = 0; j < attrs.nelts; j++) {
+            key = &attr[j].key;
+            value = &attr[j].value;
+            if (ngx_strncasecmp(key->data, (u_char *) "sessionid", 9) == 0
+                && value->data)
+            {
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                       "proxy_pass: \"%V: %V\"", key, value);
+
+                char *value_str = ngx_pcstrdup(r->pool, value);
+                char *end = NULL;
+                uint64_t so_mark_u64 = strtoul(value_str, &end, 0);
+                if (end == value_str) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        "proxy_pass: strtoul() failed");
+                    return NGX_ERROR;
+                }
+                else if ((so_mark_u64 == ULONG_MAX && errno == ERANGE)
+                         || errno == EINVAL)
+                {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        "proxy_pass: strtoul() failed: %s", strerror(errno));
+                    return NGX_ERROR;
+                }
+                else if (so_mark_u64 > UINT32_MAX) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        "proxy_pass: mark must be up to %ud", UINT32_MAX);
+                    return NGX_ERROR;
+                }
+
+                *so_mark = so_mark_u64;
+                return NGX_OK;
+            }
+        }
+    }
+
+    return NGX_ERROR;
+}
 
 static ngx_int_t
 ngx_http_proxy_create_request(ngx_http_request_t *r)
 {
     size_t                        len, uri_len, loc_len, body_len,
                                   key_len, val_len;
+    uint32_t                      so_mark;
     uintptr_t                     escape;
     ngx_buf_t                    *b;
     ngx_str_t                     method;
@@ -1165,6 +1310,14 @@ ngx_http_proxy_create_request(ngx_http_request_t *r)
     ngx_http_script_engine_t      e, le;
     ngx_http_proxy_loc_conf_t    *plcf;
     ngx_http_script_len_code_pt   lcode;
+
+    if (r->upstream->so_marking) {
+        if (ngx_http_proxy_get_cookie_mark(r, &so_mark) == NGX_OK) {
+            r->upstream->peer.so_mark = so_mark;
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                "proxy_pass: Will mark traffic with %uD", r->upstream->peer.so_mark);
+        }
+    }
 
     u = r->upstream;
 
@@ -2834,6 +2987,7 @@ ngx_http_proxy_create_loc_conf(ngx_conf_t *cf)
     conf->upstream.store = NGX_CONF_UNSET;
     conf->upstream.store_access = NGX_CONF_UNSET_UINT;
     conf->upstream.next_upstream_tries = NGX_CONF_UNSET_UINT;
+    conf->upstream.so_marking = NGX_CONF_UNSET;
     conf->upstream.buffering = NGX_CONF_UNSET;
     conf->upstream.request_buffering = NGX_CONF_UNSET;
     conf->upstream.ignore_client_abort = NGX_CONF_UNSET;
@@ -2945,6 +3099,9 @@ ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_uint_value(conf->upstream.next_upstream_tries,
                               prev->upstream.next_upstream_tries, 0);
+
+    ngx_conf_merge_value(conf->upstream.so_marking,
+                              prev->upstream.so_marking, 0);
 
     ngx_conf_merge_value(conf->upstream.buffering,
                               prev->upstream.buffering, 1);
